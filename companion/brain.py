@@ -13,6 +13,8 @@ class Brain:
         self.extra_body = cfg.get("extra_body", {})
         self.max_tokens = int(cfg.get("max_tokens", 200))
         self.system_prompt = cfg["system_prompt"]
+        self.hermes_provider = cfg.get("hermes_provider")
+        self.hermes_model = cfg.get("hermes_model")
         # one conversation history per person
         self.histories: dict[str, list[dict]] = {}
 
@@ -40,20 +42,25 @@ class Brain:
     def ask_hermes(self, person: str, task: str) -> str:
         """Hand a real task to the Hermes agent. Slower, but it has hands."""
         try:
+            cmd = [
+                "hermes",
+                "-z",
+                f"(Spoken request from {person}, relayed by the Reachy desk "
+                f"robot. Answer in 1-3 short spoken sentences, no markdown.) "
+                f"{task}",
+            ]
+            if self.hermes_provider and self.hermes_model:
+                cmd += ["--provider", self.hermes_provider, "-m", self.hermes_model]
             result = subprocess.run(
-                [
-                    "hermes",
-                    "-z",
-                    f"(Spoken request from {person}, relayed by the Reachy desk "
-                    f"robot. Answer in 1-3 short spoken sentences, no markdown.) "
-                    f"{task}",
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=300,
             )
-            answer = result.stdout.strip().splitlines()
-            return answer[-1] if answer else "Hermes didn't answer, sorry."
+            answer = " ".join(
+                line.strip() for line in result.stdout.strip().splitlines() if line.strip()
+            )
+            return answer or "Hermes didn't answer, sorry."
         except subprocess.TimeoutExpired:
             return "That took too long, I gave up on it."
         except Exception:

@@ -56,4 +56,9 @@ class Ears:
         result = mlx_whisper.transcribe(
             audio, path_or_hf_repo=self.whisper_model, language="en"
         )
-        return result["text"].strip()
+        text = result["text"].strip()
+        # whisper sometimes hallucinates loops ("face face face...") on noise
+        words = text.lower().split()
+        if len(words) > 8 and len(set(words)) / len(words) < 0.3:
+            return ""
+        return text

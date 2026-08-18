@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.141.1",
     "insightface>=1.0.1",
     "kokoro-onnx>=0.5.0",
     "mlx-whisper>=0.4.3",
@@ -15,4 +16,5 @@ dependencies = [
     "pyyaml>=6.0.3",
     "reachy-mini>=1.9.0",
     "sounddevice>=0.5.6",
+    "uvicorn>=0.52.3",
 ]

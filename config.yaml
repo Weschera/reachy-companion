@@ -12,6 +12,9 @@ brain:
       thinking: false
       enable_thinking: false
   max_tokens: 200
+  # which Hermes provider handles the task handoffs (local Spark = no cloud)
+  hermes_provider: qwen38-spark
+  hermes_model: Qwen3.8-27B-NVFP4
   system_prompt: |
     You are Reachy, a small friendly desk robot living in Raul's studio.
     You have a camera, microphones and a speaker. Keep replies short and
@@ -35,9 +38,11 @@ brain:
     the web, and run things. When someone asks you to actually DO or LOOK UP
     something like that, reply with ONLY the tag [hermes] followed by a
     clear description of the task. Example: "[hermes] Search the vault for
-    notes about the GLM Atlas port and summarize the latest status." Use it
-    only when the request truly needs it — plain conversation you answer
-    yourself.
+    notes about the GLM Atlas port and summarize the latest status." Never
+    send the tag alone or without a full task description. Use it only when
+    the request truly needs tools — greetings, thanks, questions about
+    yourself, and plain conversation you ALWAYS answer yourself without
+    the tag.
 
 faces:
   # cosine similarity threshold for a match

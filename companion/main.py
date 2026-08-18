@@ -92,8 +92,28 @@ class Companion:
             mini.goto_target(body_yaw=yaw, duration=1.2)
             mini.goto_target(body_yaw=0.0, duration=1.2)
 
+    def share_state(self, frame):
+        """Drop a snapshot + status file for the dashboard."""
+        try:
+            if frame is not None:
+                import cv2
+
+                cv2.imwrite("/tmp/reachy-latest.jpg", frame)
+            with open("/tmp/reachy-status.json", "w") as f:
+                json.dump(
+                    {
+                        "person": self.current_person,
+                        "voices": self.voice_overrides,
+                        "updated": time.time(),
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+
     def scan_faces(self, mini):
         frame = mini.media.get_frame()
+        self.share_state(frame)
         if frame is None:
             return
         found = self.faces.biggest_face(frame)
@@ -122,6 +142,14 @@ class Companion:
         audio = self.ears.record_utterance(mini)
         if audio is None:
             return
+        # take a quick look at who's talking before answering
+        if self.current_person is None:
+            frame = mini.media.get_frame()
+            if frame is not None:
+                found = self.faces.biggest_face(frame)
+                if found and found[0] is not None:
+                    self.current_person = found[0]
+                    self.last_seen_at = time.monotonic()
         text = self.ears.transcribe(audio)
         if len(text) < 2:
             return
@@ -132,6 +160,10 @@ class Companion:
         # real tasks get handed to the Hermes agent
         if answer.lstrip().lower().startswith("[hermes]"):
             task = answer.lstrip()[8:].strip()
+            if len(task) < 10:  # tag misfire with no real task — ignore it
+                log.info("empty hermes tag, dropping")
+                self.brain.histories[person].pop()
+                return
             voice = self.voice_overrides.get(person, profile["voice"])
             self.voice.speak(mini, "Let me look into that.", voice, profile.get("speed"))
             log.info("asking hermes: %s", task)
