@@ -4,9 +4,10 @@ cd "$(dirname "$0")"
 
 # a sane environment even when launched from the dashboard or launchd
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-# clear a possibly-poisoned GStreamer plugin cache (libgstpython segfaults
-# and is renamed .disabled in the venv — see README troubleshooting)
-rm -f "$HOME/.cache/gstreamer-1.0"/registry.*.bin 2>/dev/null
+# scan GStreamer plugins in-process: the forked scanner children segfault
+# on macOS and spam crash-report dialogs (the bad libgstpython plugin is
+# already renamed .disabled, so in-process scanning is safe)
+export GST_REGISTRY_FORK=no
 
 # ask nicely, then insist
 pkill -INT -f "companion.main" 2>/dev/null
