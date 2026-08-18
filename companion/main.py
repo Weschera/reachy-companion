@@ -130,9 +130,13 @@ class Companion:
         """Drop a snapshot + status file for the dashboard."""
         try:
             if frame is not None:
+                import os
+
                 import cv2
 
-                cv2.imwrite("/tmp/reachy-latest.jpg", frame)
+                # atomic swap so the dashboard never reads a half-written jpeg
+                cv2.imwrite("/tmp/reachy-latest.tmp.jpg", frame)
+                os.replace("/tmp/reachy-latest.tmp.jpg", "/tmp/reachy-latest.jpg")
             with open("/tmp/reachy-status.json", "w") as f:
                 json.dump(
                     {
@@ -182,10 +186,10 @@ class Companion:
         of the offset (damped P-control) and small offsets are ignored.
         Full-speed chasing oscillates; this converges.
         """
-        GAIN = 0.8
+        GAIN = 0.7
         LEAD = 0.15  # seconds of velocity lead — aim where the face is heading
-        DEADBAND = 0.055  # fraction of frame size
-        CMD_SPACING = 0.35  # let each move show up on camera before the next
+        DEADBAND = 0.11  # fraction of frame size — a wide calm zone
+        CMD_SPACING = 0.55  # let each move show up on camera before the next
         last_pos = None  # face position last seen (u, v)
         last_t = 0.0
         last_cmd = 0.0
@@ -203,18 +207,23 @@ class Companion:
                 cx, cy = w / 2, h / 2
                 boxes = self.faces.detect_boxes(frame)
                 if len(boxes) == 0:
-                    # face slipped out — after a beat, glance toward its exit side
+                    # face gone — don't hunt (relative glances ratchet the head
+                    # away until it faces the wall). Recenter once and wait.
                     now = time.monotonic()
                     if lost_since is None:
                         lost_since = now
-                    elif (
-                        now - lost_since > 1.0
-                        and last_pos is not None
-                        and now - self.last_tracked < 6
-                    ):
-                        edge = 0.15 * w if last_pos[0] < cx else 0.85 * w
-                        mini.look_at_image(u=int(edge), v=int(cy), duration=0.5)
-                        lost_since = now
+                    elif now - lost_since > 2.5:
+                        log.info("track: face lost — recentering")
+                        import numpy as np
+
+                        from reachy_mini.reachy_mini import INIT_HEAD_POSE
+
+                        mini.goto_target(
+                            head=INIT_HEAD_POSE, body_yaw=0.0, duration=1.2
+                        )
+                        lost_since = None
+                        last_pos = None
+                        self.last_tracked = 0.0
                     continue
                 lost_since = None
 
@@ -238,15 +247,24 @@ class Companion:
                     vx = (u - last_pos[0]) / (now - last_t)
                     vy = (v - last_pos[1]) / (now - last_t)
                 last_pos, last_t = (u, v), now
-                dx, dy = u - cx, v - cy
+                # settle with the gaze a touch lower — eye contact, not hairline
+                dx, dy = u - cx, v - cy + 0.05 * h
                 self.last_tracked = now
+                if now - getattr(self, "_track_dbg_at", 0) > 5:
+                    self._track_dbg_at = now
+                    log.info("track: face u=%d v=%d dx=%d dy=%d busy=%s", u, v, dx, dy, self.busy)
                 if now - last_cmd < CMD_SPACING:
                     continue  # previous move hasn't reached the camera yet
-                if abs(dx) < DEADBAND * w and abs(dy) < DEADBAND * h and abs(vx) < 40:
-                    continue  # close enough and slow — don't fidget
+                if abs(dx) < DEADBAND * w and abs(dy) < DEADBAND * h:
+                    continue  # close enough — hold still
+                # ignore jittery velocity readings; only lead real movement
+                if abs(vx) < 90:
+                    vx = 0.0
+                if abs(vy) < 90:
+                    vy = 0.0
                 aim_u = max(0, min(w - 1, cx + GAIN * dx + LEAD * vx))
                 aim_v = max(0, min(h - 1, cy + GAIN * dy + LEAD * vy))
-                mini.look_at_image(u=int(aim_u), v=int(aim_v), duration=0.3)
+                mini.look_at_image(u=int(aim_u), v=int(aim_v), duration=0.45)
                 last_cmd = now
             except Exception:
                 if time.monotonic() - getattr(self, "_track_err_at", 0) > 30:
@@ -261,7 +279,7 @@ class Companion:
                 self.share_state(mini.media.get_frame())
             except Exception:
                 pass
-            stop.wait(2.0)
+            stop.wait(0.25)
 
     def scan_faces(self, mini):
         frame = mini.media.get_frame()
@@ -290,11 +308,15 @@ class Companion:
                 self.unknown_streak >= 8
                 and now - self.last_seen_at > 30
                 and now - self.last_meet_attempt > self.meet_cooldown
+                and not self.modes()["wake_word"]  # don't initiate in quiet mode
             ):
                 self.meet_new_person(mini)
             return
         self.unknown_streak = 0
         now = time.monotonic()
+        # in wake-word mode, only the wake-up greeting is allowed
+        if self.modes()["wake_word"] and now - self.started_at > 60:
+            return
         if now - self.last_greeted.get(name, -1e9) > self.greet_cooldown:
             self.last_greeted[name] = now
             person, profile = self.person_profile(name)
@@ -510,6 +532,7 @@ class Companion:
     # ---------- main loop ----------
 
     def run(self):
+        self.started_at = time.monotonic()
         log.info("connecting to reachy at %s...", self.cfg["robot"]["host"])
         with ReachyMini(
             host=self.cfg["robot"]["host"],

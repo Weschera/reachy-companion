@@ -18,7 +18,12 @@ import uvicorn
 import yaml
 from pydantic import BaseModel
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 
 ROOT = Path(__file__).resolve().parent
 LOG = Path("/tmp/reachy-companion.log")
@@ -101,6 +106,32 @@ def frame():
     if FRAME.exists():
         return FileResponse(FRAME, media_type="image/jpeg")
     return JSONResponse({"error": "no frame"}, status_code=404)
+
+
+@app.get("/api/stream")
+def stream():
+    """Live MJPEG stream of what Reachy sees (~5 fps)."""
+
+    def frames():
+        last = b""
+        while True:
+            try:
+                data = FRAME.read_bytes()
+                if data and data != last:
+                    last = data
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\n"
+                        + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                        + data
+                        + b"\r\n"
+                    )
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    return StreamingResponse(
+        frames(), media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 
 VOICES = [
@@ -558,9 +589,9 @@ async function refreshState() {
       !s.running ? 'asleep' : (s.person ? 'with ' + s.person : 'watching the room');
     const cam = document.getElementById('cam'), off = document.getElementById('camoff');
     if (s.frame_fresh) {
-      cam.src = '/api/frame?t=' + Date.now();
+      if (!cam.src.includes('/api/stream')) cam.src = '/api/stream';
       cam.hidden = false; off.style.display = 'none';
-    } else { cam.hidden = true; off.style.display = 'flex'; }
+    } else { cam.removeAttribute('src'); cam.hidden = true; off.style.display = 'flex'; }
   } catch (e) {}
 }
 
