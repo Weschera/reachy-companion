@@ -145,13 +145,23 @@ class Companion:
         if audio is None:
             return
         # take a quick look at who's talking before answering
-        if self.current_person is None:
-            frame = mini.media.get_frame()
-            if frame is not None:
-                found = self.faces.biggest_face(frame)
-                if found and found[0] is not None:
+        anyone_visible = False
+        frame = mini.media.get_frame()
+        if frame is not None:
+            found = self.faces.biggest_face(frame)
+            if found:
+                anyone_visible = True
+                if found[0] is not None:
                     self.current_person = found[0]
                     self.last_seen_at = time.monotonic()
+        # no face in view and nobody seen recently → probably a TV or
+        # background chatter, not someone talking to us
+        if not anyone_visible and (
+            self.current_person is None
+            or time.monotonic() - self.last_seen_at > self.identity_memory
+        ):
+            log.info("ignored speech (nobody in view)")
+            return
         text = self.ears.transcribe(audio)
         if len(text) < 2:
             return
@@ -201,6 +211,42 @@ class Companion:
         if answer:
             self.voice.speak(mini, answer, voice, profile.get("speed"))
 
+    def check_commands(self, mini):
+        """Commands dropped by the dashboard: say something, enroll a face."""
+        cmd_path = "/tmp/reachy-cmd.json"
+        try:
+            with open(cmd_path) as f:
+                cmd = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        import os
+
+        os.remove(cmd_path)
+        if text := cmd.get("say"):
+            log.info("dashboard says: %s", text)
+            person, profile = self.person_profile(self.current_person)
+            voice = cmd.get("voice") or self.voice_overrides.get(person, profile["voice"])
+            self.voice.speak(mini, text, voice)
+        elif name := cmd.get("enroll"):
+            log.info("enrolling %s from dashboard", name)
+            self.voice.speak(mini, f"Hold still, {name} — I'm learning your face.")
+            embeddings = []
+            deadline = time.monotonic() + 30
+            while len(embeddings) < 10 and time.monotonic() < deadline:
+                frame = mini.media.get_frame()
+                if frame is not None:
+                    found = self.faces.biggest_face(frame)
+                    if found is not None:
+                        embeddings.append(found[2].normed_embedding)
+                time.sleep(0.3)
+            if len(embeddings) >= 5:
+                self.faces.enroll(name, embeddings)
+                self.voice.speak(mini, f"Got it. Nice to meet you, {name}!")
+                log.info("enrolled %s", name)
+            else:
+                self.voice.speak(mini, "I couldn't see a face clearly, sorry.")
+                log.info("enroll failed for %s", name)
+
     # ---------- main loop ----------
 
     def run(self):
@@ -228,6 +274,7 @@ class Companion:
                             self.ears.drain(mini)
                             last_idle = time.monotonic()
                             continue
+                    self.check_commands(mini)
                     now = time.monotonic()
                     if now - last_scan > self.scan_interval:
                         last_scan = now

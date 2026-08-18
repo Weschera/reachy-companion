@@ -20,6 +20,7 @@ class Brain:
 
     def reply(self, person: str, style: str, text: str) -> str:
         history = self.histories.setdefault(person, [])
+        history[:] = [m for m in history if m["content"]]  # drop any blanks
         history.append({"role": "user", "content": text})
         history[:] = history[-20:]  # keep it light
         messages = [
@@ -36,6 +37,9 @@ class Brain:
             extra_body=self.extra_body,
         )
         answer = (response.choices[0].message.content or "").strip()
+        if not answer:
+            # model went blank — don't leave a hole in the conversation
+            answer = "Hm, I lost my train of thought. What were you saying?"
         history.append({"role": "assistant", "content": answer})
         return answer
 

@@ -6,12 +6,17 @@ Then open http://localhost:8787 (or http://<mac-ip>:8787 from your phone).
 
 import json
 import re
+import shutil
 import subprocess
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import uvicorn
 import yaml
+from pydantic import BaseModel
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
@@ -96,6 +101,126 @@ def frame():
     if FRAME.exists():
         return FileResponse(FRAME, media_type="image/jpeg")
     return JSONResponse({"error": "no frame"}, status_code=404)
+
+
+VOICES = [
+    "af_heart", "af_bella", "af_nicole", "af_sky",
+    "am_michael", "am_adam", "am_eric",
+    "bf_emma", "bm_george", "bm_lewis",
+]
+CMD = Path("/tmp/reachy-cmd.json")
+
+
+def _cfg() -> dict:
+    return yaml.safe_load((ROOT / "config.yaml").read_text())
+
+
+def _http_ok(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+class Say(BaseModel):
+    text: str
+
+
+class VoicePick(BaseModel):
+    voice: str
+
+
+class Enroll(BaseModel):
+    name: str
+
+
+@app.get("/api/health")
+def health():
+    cfg = _cfg()
+    robot = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}"
+    brain_cfg = cfg["brain"]["models"].get(cfg["brain"].get("active"), {})
+    checks = {
+        "robot": lambda: _http_ok(f"{robot}/api/daemon/status"),
+        "brain": lambda: _http_ok(f"{brain_cfg.get('base_url', '')}/models"),
+        "eyes": lambda: _http_ok(f"{cfg.get('eyes', {}).get('base_url', '')}/models"),
+        "hermes": lambda: shutil.which("hermes") is not None,
+    }
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = {k: pool.submit(v) for k, v in checks.items()}
+    return {k: f.result() for k, f in results.items()}
+
+
+@app.post("/api/say")
+def say(body: Say):
+    if not companion_running():
+        return JSONResponse({"error": "Reachy is asleep"}, status_code=409)
+    CMD.write_text(json.dumps({"say": body.text.strip()[:400]}))
+    return {"ok": True}
+
+
+@app.get("/api/people")
+def people():
+    profiles = yaml.safe_load((ROOT / "profiles.yaml").read_text())
+    known = []
+    store = ROOT / "data" / "faces.npz"
+    if store.exists():
+        with np.load(store) as z:
+            known = list(z.files)
+    return {
+        "voices": VOICES,
+        "people": [
+            {
+                "name": n,
+                "voice": profiles.get("people", {}).get(n, {}).get(
+                    "voice", profiles.get("unknown", {}).get("voice", "af_sky")
+                ),
+            }
+            for n in known
+        ],
+    }
+
+
+@app.post("/api/people/{name}/voice")
+def set_voice(name: str, body: VoicePick):
+    if body.voice not in VOICES:
+        return JSONResponse({"error": "unknown voice"}, status_code=400)
+    path = ROOT / "profiles.yaml"
+    profiles = yaml.safe_load(path.read_text())
+    profiles.setdefault("people", {}).setdefault(
+        name, {"speed": 1.0, "style": f"This is {name}. Be friendly with them."}
+    )["voice"] = body.voice
+    path.write_text(
+        "# People Reachy knows — managed from the dashboard.\n"
+        + yaml.safe_dump(profiles, sort_keys=False, allow_unicode=True)
+    )
+    return {"ok": True}
+
+
+@app.post("/api/people/enroll")
+def enroll(body: Enroll):
+    name = body.name.strip()[:40]
+    if not name:
+        return JSONResponse({"error": "empty name"}, status_code=400)
+    if not companion_running():
+        return JSONResponse({"error": "Reachy is asleep"}, status_code=409)
+    CMD.write_text(json.dumps({"enroll": name}))
+    return {"ok": True}
+
+
+@app.post("/api/estop")
+def estop():
+    subprocess.run(["pkill", "-9", "-f", "companion.main"], capture_output=True)
+    cfg = _cfg()
+    robot = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}"
+    for path in ("/api/move/stop", "/api/motors/set_mode/disabled"):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{robot}{path}", method="POST"), timeout=3
+            )
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 @app.get("/api/models")
@@ -195,6 +320,43 @@ PAGE = """<!doctype html>
   .msg.event { align-self: center; background: none; color: var(--dim); font-size: 12px;
                padding: 0 6px; }
 
+  .health { display: flex; gap: 8px; }
+  .chip { flex: 1; display: flex; align-items: center; gap: 7px; justify-content: center;
+          background: var(--panel); border-radius: 11px; padding: 8px 4px;
+          font-size: 12px; color: var(--dim); }
+  .chip .light { width: 7px; height: 7px; border-radius: 50%; background: #6b5f50;
+                 transition: background 300ms var(--ease-out); }
+  .chip.ok .light { background: var(--green); }
+  .chip.bad .light { background: #d96a5a; }
+
+  .sayrow { display: flex; gap: 8px; }
+  .sayrow input {
+    flex: 1; background: var(--panel); color: var(--text); border: 0;
+    border-radius: 13px; padding: 12px 14px; font: 14px/1 -apple-system, system-ui, sans-serif;
+    outline: none;
+  }
+  .sayrow input::placeholder { color: var(--dim); }
+  .sayrow button { flex: none; padding: 0 18px; }
+
+  .people { background: var(--panel); border-radius: 16px; padding: 6px 14px; }
+  .person { display: flex; align-items: center; gap: 10px; padding: 9px 0;
+            border-bottom: 1px solid rgba(255,255,255,.04); }
+  .person:last-child { border-bottom: 0; }
+  .person .pname { flex: 1; font-size: 14px; font-weight: 550; }
+  .person select { flex: none; width: 130px; }
+  .addrow { padding: 10px 0; }
+  .addrow button { width: 100%; background: none; color: var(--dim);
+                   border: 1px dashed #3a322a; }
+
+  .estop {
+    width: 100%; padding: 14px 0; border-radius: 13px;
+    background: rgba(217, 106, 90, .15); color: #e08a7c;
+    font-weight: 650; letter-spacing: 0.02em;
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .estop:hover { background: rgba(217, 106, 90, .28); }
+  }
+
   .brainrow { display: flex; align-items: center; gap: 10px;
               background: var(--panel); border-radius: 13px; padding: 10px 14px; }
   .brainrow label { color: var(--dim); font-size: 13px; flex: none; }
@@ -236,6 +398,20 @@ PAGE = """<!doctype html>
 
   <div class="chat" id="chat"></div>
 
+  <div class="health" id="health">
+    <div class="chip" data-k="robot"><div class="light"></div>robot</div>
+    <div class="chip" data-k="brain"><div class="light"></div>brain</div>
+    <div class="chip" data-k="eyes"><div class="light"></div>eyes</div>
+    <div class="chip" data-k="hermes"><div class="light"></div>hermes</div>
+  </div>
+
+  <form class="sayrow" id="sayform">
+    <input id="saytext" placeholder="Make Reachy say something…" autocomplete="off">
+    <button class="primary" type="submit">Say</button>
+  </form>
+
+  <div class="people" id="people"></div>
+
   <div class="brainrow">
     <label for="brain">Brain</label>
     <select id="brain"></select>
@@ -246,6 +422,8 @@ PAGE = """<!doctype html>
     <button id="restart">Restart</button>
     <button id="sleep">Sleep</button>
   </div>
+
+  <button class="estop" id="estop">EMERGENCY STOP</button>
 </div>
 
 <script>
@@ -303,6 +481,66 @@ brainSel.onchange = () =>
   fetch('/api/models/' + brainSel.value, { method: 'POST' })
     .then(() => setTimeout(refreshState, 2000));
 loadModels();
+
+// --- say ---
+document.getElementById('sayform').onsubmit = async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('saytext');
+  const text = input.value.trim();
+  if (!text) return;
+  const r = await fetch('/api/say', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ text }) });
+  if (r.ok) input.value = '';
+  else input.placeholder = 'Reachy is asleep — wake it first';
+};
+
+// --- health ---
+async function refreshHealth() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    document.querySelectorAll('.chip').forEach(c => {
+      const k = c.dataset.k;
+      c.classList.toggle('ok', !!h[k]);
+      c.classList.toggle('bad', !h[k]);
+    });
+  } catch (e) {}
+}
+refreshHealth();
+setInterval(refreshHealth, 10000);
+
+// --- people ---
+async function refreshPeople() {
+  try {
+    const p = await (await fetch('/api/people')).json();
+    const rows = p.people.map(person => `
+      <div class="person">
+        <div class="pname">${esc(person.name)}</div>
+        <select data-name="${esc(person.name)}">
+          ${p.voices.map(v => `<option ${v === person.voice ? 'selected' : ''}>${v}</option>`).join('')}
+        </select>
+      </div>`).join('');
+    document.getElementById('people').innerHTML = rows +
+      `<div class="addrow"><button id="addperson">+ teach Reachy a new face</button></div>`;
+    document.querySelectorAll('.person select').forEach(sel => {
+      sel.onchange = () => fetch('/api/people/' + encodeURIComponent(sel.dataset.name) + '/voice',
+        { method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ voice: sel.value }) });
+    });
+    document.getElementById('addperson').onclick = async () => {
+      const name = prompt('Who is Reachy meeting? (have them sit in front of the camera)');
+      if (!name) return;
+      const r = await fetch('/api/people/enroll', { method: 'POST',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name }) });
+      alert(r.ok ? 'Reachy is looking — hold still for ~10 seconds!' : 'Reachy is asleep — wake it first.');
+      setTimeout(refreshPeople, 15000);
+    };
+  } catch (e) {}
+}
+refreshPeople();
+
+// --- emergency stop ---
+document.getElementById('estop').onclick = () =>
+  fetch('/api/estop', { method: 'POST' }).then(() => setTimeout(refreshState, 1000));
 
 refreshState(); refreshChat();
 setInterval(refreshState, 2000);
