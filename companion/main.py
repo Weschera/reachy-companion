@@ -71,6 +71,11 @@ class Companion:
         self.mic_rms = 0.0
         # connection watchdog
         self.last_frame_at = time.monotonic()
+        # rolling pre-buffer of idle mic audio, so the first words of an
+        # utterance (the wake word!) aren't lost to detection latency
+        from collections import deque
+
+        self.prebuffer: deque = deque()
         # what we're doing right now — shown on the dashboard status line
         self.activity = "waking up"
 
@@ -422,7 +427,9 @@ class Companion:
 
     def _converse(self, mini):
         self.activity = "listening…"
-        audio = self.ears.record_utterance(mini)
+        prelude = list(self.prebuffer)
+        self.prebuffer.clear()
+        audio = self.ears.record_utterance(mini, prelude=prelude)
         if audio is None:
             return
         self.activity = "thinking…"
@@ -450,7 +457,14 @@ class Companion:
         # wake-word mode: only respond when addressed (or mid-conversation)
         if self.modes()["wake_word"]:
             lowered = text.lower()
-            addressed = any(w in lowered for w in ("reachy", "richie", "ritchie", "reach"))
+            # whisper spells the name a dozen ways — accept them all
+            addressed = any(
+                w in lowered
+                for w in (
+                    "reachy", "richie", "ritchie", "reach", "reggie", "ricci",
+                    "richy", "ricky", "reachie", "retchy", "regi", "rechy",
+                )
+            )
             in_conversation = time.monotonic() - self.last_interaction < self.follow_up_window
             if not addressed and not in_conversation:
                 log.info("ignored (wake-word mode, not addressed): %s", text)
@@ -601,13 +615,17 @@ class Companion:
                     if time.monotonic() - self.last_frame_at > 30:
                         raise ConnectionError("media stalled — reconnecting")
                     self.check_commands(mini)
-                    # drain idle mic audio and measure the room's loudness
+                    # drain idle mic audio: measure loudness AND keep the
+                    # last ~2s so wake words aren't clipped off recordings
                     peak = 0.0
                     sample = mini.media.get_audio_sample()
                     while sample is not None:
                         mono = sample.mean(axis=1) if sample.ndim == 2 else sample
                         peak = max(peak, float((mono**2).mean() ** 0.5))
+                        self.prebuffer.append(mono.astype("float32"))
                         sample = mini.media.get_audio_sample()
+                    while sum(len(c) for c in self.prebuffer) > 32000:  # ~2s
+                        self.prebuffer.popleft()
                     if peak:
                         self.mic_rms = peak
                     now = time.monotonic()

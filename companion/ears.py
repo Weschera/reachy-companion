@@ -23,9 +23,13 @@ class Ears:
         while mini.media.get_audio_sample() is not None:
             pass
 
-    def record_utterance(self, mini) -> np.ndarray | None:
-        """Record until the speaker goes quiet. Returns 16 kHz mono float32."""
-        chunks = []
+    def record_utterance(self, mini, prelude=None) -> np.ndarray | None:
+        """Record until the speaker goes quiet. Returns 16 kHz mono float32.
+
+        `prelude` is audio buffered from just before speech was detected —
+        without it the first words ("Hey Reachy") get clipped off.
+        """
+        chunks = list(prelude) if prelude else []
         started = time.monotonic()
         last_loud = started
         while True:
