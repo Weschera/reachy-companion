@@ -92,8 +92,28 @@ def state():
     return {
         "running": companion_running(),
         "person": status.get("person") if fresh else None,
+        "activity": status.get("activity") if fresh else None,
         "frame_fresh": FRAME.exists() and time.time() - FRAME.stat().st_mtime < 15,
     }
+
+
+def _find_battery(obj):
+    """Scan robot status JSON for anything battery/charge-shaped."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if any(w in k.lower() for w in ("battery", "charge", "soc")) and isinstance(
+                v, (int, float)
+            ):
+                return v
+            found = _find_battery(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_battery(item)
+            if found is not None:
+                return found
+    return None
 
 
 @app.get("/api/transcript")
@@ -171,15 +191,32 @@ def health():
     cfg = _cfg()
     robot = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}"
     brain_cfg = cfg["brain"]["models"].get(cfg["brain"].get("active"), {})
+
+    def robot_check():
+        """Reachability + link quality (ms) + battery if the daemon shows one."""
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(f"{robot}/api/daemon/status", timeout=2) as r:
+                data = json.load(r)
+            ms = int((time.perf_counter() - t0) * 1000)
+            return {"ok": True, "ms": ms, "battery": _find_battery(data)}
+        except Exception:
+            return {"ok": False, "ms": None, "battery": None}
+
     checks = {
-        "robot": lambda: _http_ok(f"{robot}/api/daemon/status"),
+        "robot": robot_check,
         "brain": lambda: _http_ok(f"{brain_cfg.get('base_url', '')}/models"),
         "eyes": lambda: _http_ok(f"{cfg.get('eyes', {}).get('base_url', '')}/models"),
         "hermes": lambda: shutil.which("hermes") is not None,
     }
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = {k: pool.submit(v) for k, v in checks.items()}
-    return {k: f.result() for k, f in results.items()}
+    out = {k: f.result() for k, f in results.items()}
+    robot_info = out.pop("robot")
+    out["robot"] = robot_info["ok"]
+    out["robot_ms"] = robot_info["ms"]
+    out["battery"] = robot_info["battery"]
+    return out
 
 
 @app.post("/api/say")
@@ -360,6 +397,43 @@ def models():
     }
 
 
+class NewModel(BaseModel):
+    label: str
+    base_url: str
+    model: str
+    api_key: str | None = None
+
+
+@app.post("/api/models/add")
+def add_model(body: NewModel):
+    label = body.label.strip()[:60]
+    base_url = body.base_url.strip().rstrip("/")
+    model = body.model.strip()
+    if not (label and base_url.startswith("http") and model):
+        return JSONResponse({"error": "need label, http(s) url, and model"}, status_code=400)
+    key = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:30] or "custom"
+    path = ROOT / "config.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    if key in cfg["brain"]["models"]:
+        return JSONResponse({"error": f"'{key}' already exists"}, status_code=400)
+    # insert as text right under `  models:` so comments stay intact
+    block = (
+        f"    {key}:\n"
+        f"      label: {json.dumps(label)}\n"
+        f"      base_url: {json.dumps(base_url)}\n"
+        f"      model: {json.dumps(model)}\n"
+    )
+    if body.api_key:
+        block += f"      api_key: {json.dumps(body.api_key.strip())}\n"
+    text = path.read_text()
+    new_text = re.sub(r"(?m)^(  models:)$", rf"\g<1>\n{block.rstrip()}", text, count=1)
+    if new_text == text:
+        return JSONResponse({"error": "could not find models section"}, status_code=500)
+    yaml.safe_load(new_text)  # sanity: still valid yaml
+    path.write_text(new_text)
+    return {"ok": True, "key": key}
+
+
 @app.post("/api/models/{key}")
 def set_model(key: str):
     path = ROOT / "config.yaml"
@@ -460,6 +534,12 @@ PAGE = """<!doctype html>
     outline: none;
   }
   .sayrow input::placeholder { color: var(--dim); }
+  #addmodelform input {
+    background: var(--panel-2); color: var(--text); border: 0;
+    border-radius: 9px; padding: 9px 11px; font: 13px/1 -apple-system, system-ui, sans-serif;
+    outline: none;
+  }
+  #addmodelform input::placeholder { color: var(--dim); }
   .sayrow button { flex: none; padding: 0 18px; }
 
   .people { background: var(--panel); border-radius: 16px; padding: 6px 14px; }
@@ -512,7 +592,10 @@ PAGE = """<!doctype html>
   <header>
     <div class="dot" id="dot"></div>
     <h1>Reachy</h1>
-    <div class="sub" id="sub">…</div>
+    <div class="sub">
+      <span id="batt" style="margin-right:8px;"></span>
+      <span id="sub">…</span>
+    </div>
   </header>
 
   <div class="cam">
@@ -561,9 +644,20 @@ PAGE = """<!doctype html>
     <div class="chip toggle" data-m="vigilante"><div class="light"></div>vigilante</div>
   </div>
 
-  <div class="brainrow">
-    <label for="brain">Brain</label>
-    <select id="brain"></select>
+  <div class="brainrow" style="flex-direction:column; align-items:stretch; gap:8px;">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <label for="brain">Brain</label>
+      <select id="brain"></select>
+      <button id="addmodeltoggle" style="flex:none; padding:6px 12px; font-size:12px;">+ add</button>
+    </div>
+    <div id="addmodelform" hidden style="display:flex; flex-direction:column; gap:6px;">
+      <input id="nm-label" placeholder="Name (e.g. GLM on Spark 2)">
+      <input id="nm-url" placeholder="Address (e.g. http://10.0.0.5:8000/v1)">
+      <input id="nm-model" placeholder="Model name (e.g. glm-5.2)">
+      <input id="nm-key" placeholder="API key (leave empty for local)">
+      <button class="primary" id="nm-save">Save model</button>
+      <div id="nm-msg" style="color:var(--dim); font-size:12px;"></div>
+    </div>
   </div>
 
   <div class="controls">
@@ -585,8 +679,13 @@ async function refreshState() {
   try {
     const s = await (await fetch('/api/state')).json();
     document.getElementById('dot').classList.toggle('on', s.running);
-    document.getElementById('sub').textContent =
-      !s.running ? 'asleep' : (s.person ? 'with ' + s.person : 'watching the room');
+    // live status line: what is it doing right now?
+    let sub = 'asleep';
+    if (s.running) {
+      if (s.activity && s.activity !== 'idle') sub = s.activity;
+      else sub = s.person ? 'watching ' + s.person : 'watching the room';
+    }
+    document.getElementById('sub').textContent = sub;
     const cam = document.getElementById('cam'), off = document.getElementById('camoff');
     if (s.frame_fresh) {
       if (!cam.src.includes('/api/stream')) cam.src = '/api/stream';
@@ -605,8 +704,15 @@ async function refreshChat() {
       if (m.who === 'event')
         return `<div class="msg event">${esc(m.text)}</div>`;
       const name = m.who === 'reachy' ? (m.via ? 'Reachy · via Hermes' : 'Reachy') : esc(m.name || 'You');
-      return `<div class="msg ${m.who}"><div class="meta">${name} · ${m.time}</div>${esc(m.text)}</div>`;
+      const replay = m.who === 'reachy' ? ' replayable" style="cursor:pointer" title="tap to make Reachy say this again' : '';
+      return `<div class="msg ${m.who}${replay}"><div class="meta">${name} · ${m.time}</div>${esc(m.text)}</div>`;
     }).join('');
+    // tap a Reachy bubble → it says it again
+    chat.querySelectorAll('.msg.replayable').forEach(el => {
+      el.onclick = () => fetch('/api/say', { method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ text: el.childNodes[1].textContent }) });
+    });
     chat.scrollTop = chat.scrollHeight;
   } catch (e) {}
 }
@@ -631,6 +737,29 @@ brainSel.onchange = () =>
     .then(() => setTimeout(refreshState, 2000));
 loadModels();
 
+// --- add model ---
+document.getElementById('addmodeltoggle').onclick = () => {
+  const f = document.getElementById('addmodelform');
+  f.hidden = !f.hidden;
+};
+document.getElementById('nm-save').onclick = async () => {
+  const msg = document.getElementById('nm-msg');
+  const body = {
+    label: document.getElementById('nm-label').value,
+    base_url: document.getElementById('nm-url').value,
+    model: document.getElementById('nm-model').value,
+    api_key: document.getElementById('nm-key').value || null,
+  };
+  const r = await fetch('/api/models/add', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (r.ok) {
+    msg.textContent = 'saved — it\\'s in the list now';
+    ['nm-label','nm-url','nm-model','nm-key'].forEach(id => document.getElementById(id).value = '');
+    loadModels();
+  } else msg.textContent = j.error || 'something went wrong';
+};
+
 // --- say ---
 document.getElementById('sayform').onsubmit = async (e) => {
   e.preventDefault();
@@ -647,11 +776,19 @@ document.getElementById('sayform').onsubmit = async (e) => {
 async function refreshHealth() {
   try {
     const h = await (await fetch('/api/health')).json();
-    document.querySelectorAll('.chip').forEach(c => {
+    document.querySelectorAll('#health .chip').forEach(c => {
       const k = c.dataset.k;
       c.classList.toggle('ok', !!h[k]);
       c.classList.toggle('bad', !h[k]);
+      if (k === 'robot') {
+        // show link quality — tonight's WiFi lesson
+        const ms = h.robot_ms;
+        c.childNodes[1].textContent = ms == null ? 'robot' :
+          'robot ' + ms + 'ms' + (ms > 80 ? ' ⚠' : '');
+      }
     });
+    const batt = document.getElementById('batt');
+    batt.textContent = h.battery != null ? '🔋 ' + Math.round(h.battery) + '%' : '';
   } catch (e) {}
 }
 refreshHealth();

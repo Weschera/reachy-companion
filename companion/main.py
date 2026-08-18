@@ -71,6 +71,8 @@ class Companion:
         self.mic_rms = 0.0
         # connection watchdog
         self.last_frame_at = time.monotonic()
+        # what we're doing right now — shown on the dashboard status line
+        self.activity = "waking up"
 
     @staticmethod
     def modes() -> dict:
@@ -162,6 +164,7 @@ class Companion:
                         "person": self.current_person,
                         "voices": self.voice_overrides,
                         "mic": round(self.mic_rms, 4),
+                        "activity": self.activity,
                         "updated": time.time(),
                     },
                     f,
@@ -330,11 +333,13 @@ class Companion:
             person, profile = self.person_profile(name)
             log.info("greeting %s", person)
             self.busy = True
+            self.activity = "speaking…"
             try:
                 text = self.brain.greeting(person, profile["style"])
                 self.voice.speak(mini, text, profile["voice"], profile.get("speed"))
             finally:
                 self.busy = False
+                self.activity = "idle"
 
     VOICES = [
         "af_heart", "af_bella", "af_nicole", "af_sky",
@@ -413,11 +418,14 @@ class Companion:
             self._converse(mini)
         finally:
             self.busy = False
+            self.activity = "idle"
 
     def _converse(self, mini):
+        self.activity = "listening…"
         audio = self.ears.record_utterance(mini)
         if audio is None:
             return
+        self.activity = "thinking…"
         # take a quick look at who's talking before answering
         anyone_visible = False
         frame = mini.media.get_frame()
@@ -460,6 +468,7 @@ class Companion:
             if frame is None:
                 answer = "My camera is coming up blank right now."
             else:
+                self.activity = "looking…"
                 log.info("looking: %s", question)
                 try:
                     answer = self.eyes.look(frame, question)
@@ -478,6 +487,7 @@ class Companion:
                 return
             voice = self.voice_overrides.get(person, profile["voice"])
             self.voice.speak(mini, "Let me look into that.", voice, profile.get("speed"))
+            self.activity = "asking Hermes…"
             log.info("asking hermes: %s", task)
             answer = self.brain.ask_hermes(person, task)
             log.info("hermes: %s", answer)
@@ -492,6 +502,7 @@ class Companion:
             answer = answer[m.end():]
             log.info("voice switched to %s for %s", voice, person)
         if answer:
+            self.activity = "speaking…"
             self.voice.speak(mini, answer, voice, profile.get("speed"))
 
     def check_commands(self, mini):
@@ -561,6 +572,7 @@ class Companion:
             threading.Thread(
                 target=self._track_loop, args=(mini, snap_stop), daemon=True
             ).start()
+            self.activity = "idle"
             log.info("companion is up — ctrl-c to stop")
             last_scan = last_idle = 0.0
             try:
