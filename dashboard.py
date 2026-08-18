@@ -240,6 +240,42 @@ def set_volume_ep(body: Volume):
         return JSONResponse({"error": "robot unreachable"}, status_code=502)
 
 
+@app.get("/api/mic")
+def get_mic():
+    cfg = _cfg()
+    robot = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}"
+    out = {"level": 0.0}
+    try:
+        with urllib.request.urlopen(f"{robot}/api/volume/microphone/current", timeout=3) as r:
+            out.update(json.load(r))
+    except Exception:
+        pass
+    try:
+        status = json.loads(STATUS.read_text())
+        if time.time() - status.get("updated", 0) < 10:
+            out["level"] = status.get("mic", 0.0)
+    except Exception:
+        pass
+    return out
+
+
+@app.post("/api/mic")
+def set_mic(body: Volume):
+    cfg = _cfg()
+    url = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}/api/volume/microphone/set"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"volume": max(0, min(100, body.volume))}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)
+    except Exception:
+        return JSONResponse({"error": "robot unreachable"}, status_code=502)
+
+
 MODES = Path("/tmp/reachy-modes.json")
 
 
@@ -476,6 +512,19 @@ PAGE = """<!doctype html>
     <span id="volval" style="color:var(--dim); font-size:13px; width:32px; text-align:right;">–</span>
   </div>
 
+  <div class="brainrow" style="flex-direction:column; align-items:stretch; gap:7px;">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <label for="mic">Mic</label>
+      <input type="range" id="mic" min="0" max="100" step="5"
+             style="flex:1; accent-color: var(--warm);">
+      <span id="micval" style="color:var(--dim); font-size:13px; width:32px; text-align:right;">–</span>
+    </div>
+    <div style="height:5px; border-radius:3px; background:var(--panel-2); overflow:hidden;">
+      <div id="miclevel" style="height:100%; width:0%; border-radius:3px;
+           background:var(--green); transition: width 400ms var(--ease-out);"></div>
+    </div>
+  </div>
+
   <div class="health" id="modes">
     <div class="chip toggle" data-m="wake_word"><div class="light"></div>wake word</div>
     <div class="chip toggle" data-m="vigilante"><div class="light"></div>vigilante</div>
@@ -620,6 +669,28 @@ vol.onchange = () => {
     fetch('/api/volume', { method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ volume: +vol.value }) }), 300);
 };
+
+// --- mic ---
+const mic = document.getElementById('mic'), micval = document.getElementById('micval');
+const miclevel = document.getElementById('miclevel');
+fetch('/api/mic').then(r => r.json()).then(v => {
+  if (v.volume !== undefined) { mic.value = v.volume; micval.textContent = v.volume; }
+});
+mic.oninput = () => micval.textContent = mic.value;
+let micTimer;
+mic.onchange = () => {
+  clearTimeout(micTimer);
+  micTimer = setTimeout(() =>
+    fetch('/api/mic', { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ volume: +mic.value }) }), 300);
+};
+setInterval(async () => {
+  try {
+    const v = await (await fetch('/api/mic')).json();
+    // level is RMS 0..~0.3 — map to a useful bar
+    miclevel.style.width = Math.min(100, Math.round((v.level || 0) * 400)) + '%';
+  } catch (e) {}
+}, 1000);
 
 // --- modes ---
 async function refreshModes() {

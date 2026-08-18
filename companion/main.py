@@ -61,6 +61,11 @@ class Companion:
         self.follow_up_window = 45.0
         self.prev_gray = None
         self.last_motion_alert = 0.0
+        # face tracking
+        self.busy = False
+        self.last_tracked = 0.0
+        # live mic level for the dashboard meter
+        self.mic_rms = 0.0
 
     @staticmethod
     def modes() -> dict:
@@ -89,6 +94,9 @@ class Companion:
             return None
 
     def turn_toward_sound(self, mini, angle: float):
+        # face tracking owns the head while someone is in view
+        if time.monotonic() - self.last_tracked < 2.0:
+            return
         # DOA: 0 = left, pi/2 = front, pi = right. Body yaw: positive = left.
         yaw = max(-1.4, min(1.4, math.pi / 2 - angle))
         if abs(yaw) > 0.25:
@@ -102,6 +110,12 @@ class Companion:
             pass
 
     def idle_wiggle(self, mini):
+        # while watching someone, only the antennas fidget — the head is theirs
+        if time.monotonic() - self.last_tracked < 5.0:
+            a = random.uniform(0.1, 0.4)
+            mini.goto_target(antennas=[-a, a], duration=0.6)
+            mini.goto_target(antennas=[-0.1745, 0.1745], duration=0.6)
+            return
         r = random.random()
         if r < 0.5:
             a = random.uniform(0.1, 0.5)
@@ -124,6 +138,7 @@ class Companion:
                     {
                         "person": self.current_person,
                         "voices": self.voice_overrides,
+                        "mic": round(self.mic_rms, 4),
                         "updated": time.time(),
                     },
                     f,
@@ -132,7 +147,7 @@ class Companion:
             pass
 
     def check_motion(self, frame):
-        """Vigilante mode: spot movement, snapshot it, send it to Raul's phone."""
+        """Vigilante mode: spot movement, snapshot it, send it to your phone."""
         import cv2
 
         gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
@@ -159,6 +174,85 @@ class Companion:
                  f"👁 Reachy vigilante: movement spotted at {stamp[9:11]}:{stamp[11:13]} MEDIA:{path}"],
             )
 
+    def _track_loop(self, mini, stop):
+        """Reflex thread: keep the talking face centered.
+
+        The camera image lags the head's motion by a few hundred ms, so we
+        never chase the face at full speed — each step corrects a fraction
+        of the offset (damped P-control) and small offsets are ignored.
+        Full-speed chasing oscillates; this converges.
+        """
+        GAIN = 0.8
+        LEAD = 0.15  # seconds of velocity lead — aim where the face is heading
+        DEADBAND = 0.055  # fraction of frame size
+        CMD_SPACING = 0.35  # let each move show up on camera before the next
+        last_pos = None  # face position last seen (u, v)
+        last_t = 0.0
+        last_cmd = 0.0
+        lost_since = None
+        while not stop.is_set():
+            stop.wait(0.12)
+            if self.busy:
+                lost_since = None
+                continue
+            try:
+                frame = mini.media.get_frame()
+                if frame is None:
+                    continue
+                h, w = frame.shape[:2]
+                cx, cy = w / 2, h / 2
+                boxes = self.faces.detect_boxes(frame)
+                if len(boxes) == 0:
+                    # face slipped out — after a beat, glance toward its exit side
+                    now = time.monotonic()
+                    if lost_since is None:
+                        lost_since = now
+                    elif (
+                        now - lost_since > 1.0
+                        and last_pos is not None
+                        and now - self.last_tracked < 6
+                    ):
+                        edge = 0.15 * w if last_pos[0] < cx else 0.85 * w
+                        mini.look_at_image(u=int(edge), v=int(cy), duration=0.5)
+                        lost_since = now
+                    continue
+                lost_since = None
+
+                def center(b):
+                    return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+
+                # sticky: stay with the face we were following
+                if last_pos is not None:
+                    box = min(
+                        boxes,
+                        key=lambda b: (center(b)[0] - last_pos[0]) ** 2
+                        + (center(b)[1] - last_pos[1]) ** 2,
+                    )
+                else:
+                    box = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+                u, v = center(box)
+                now = time.monotonic()
+                # velocity of the face in the image → lead the moving target
+                vx = vy = 0.0
+                if last_pos is not None and 0 < now - last_t < 0.5:
+                    vx = (u - last_pos[0]) / (now - last_t)
+                    vy = (v - last_pos[1]) / (now - last_t)
+                last_pos, last_t = (u, v), now
+                dx, dy = u - cx, v - cy
+                self.last_tracked = now
+                if now - last_cmd < CMD_SPACING:
+                    continue  # previous move hasn't reached the camera yet
+                if abs(dx) < DEADBAND * w and abs(dy) < DEADBAND * h and abs(vx) < 40:
+                    continue  # close enough and slow — don't fidget
+                aim_u = max(0, min(w - 1, cx + GAIN * dx + LEAD * vx))
+                aim_v = max(0, min(h - 1, cy + GAIN * dy + LEAD * vy))
+                mini.look_at_image(u=int(aim_u), v=int(aim_v), duration=0.3)
+                last_cmd = now
+            except Exception:
+                if time.monotonic() - getattr(self, "_track_err_at", 0) > 30:
+                    self._track_err_at = time.monotonic()
+                    log.exception("track loop error")
+
     def _snapshot_loop(self, mini, stop):
         """Background thread: keep the dashboard's camera view fresh even
         while the main loop is busy listening or talking."""
@@ -179,7 +273,6 @@ class Companion:
         if found is None:
             return
         name, _sim, face = found
-        self.look_at_face(mini, face)
         now = time.monotonic()
         if name is not None:
             self.current_person = name
@@ -190,9 +283,12 @@ class Companion:
             self.current_person = None
         if name is None:
             # a stranger keeps appearing — introduce ourselves and learn them
+            # a familiar person moving fast can look "unknown" for a few
+            # frames — only introduce ourselves after a solid streak
             self.unknown_streak += 1
             if (
-                self.unknown_streak >= 3
+                self.unknown_streak >= 8
+                and now - self.last_seen_at > 30
                 and now - self.last_meet_attempt > self.meet_cooldown
             ):
                 self.meet_new_person(mini)
@@ -203,8 +299,12 @@ class Companion:
             self.last_greeted[name] = now
             person, profile = self.person_profile(name)
             log.info("greeting %s", person)
-            text = self.brain.greeting(person, profile["style"])
-            self.voice.speak(mini, text, profile["voice"], profile.get("speed"))
+            self.busy = True
+            try:
+                text = self.brain.greeting(person, profile["style"])
+                self.voice.speak(mini, text, profile["voice"], profile.get("speed"))
+            finally:
+                self.busy = False
 
     VOICES = [
         "af_heart", "af_bella", "af_nicole", "af_sky",
@@ -233,6 +333,13 @@ class Companion:
 
     def meet_new_person(self, mini):
         """Someone unfamiliar keeps appearing — ask who they are and learn them."""
+        self.busy = True
+        try:
+            self._meet_new_person(mini)
+        finally:
+            self.busy = False
+
+    def _meet_new_person(self, mini):
         self.last_meet_attempt = time.monotonic()
         self.unknown_streak = 0
         log.info("meeting a new face")
@@ -271,6 +378,13 @@ class Companion:
         self.voice.speak(mini, f"Got it — I'll remember you now, {name}!", voice)
 
     def converse(self, mini):
+        self.busy = True
+        try:
+            self._converse(mini)
+        finally:
+            self.busy = False
+
+    def _converse(self, mini):
         audio = self.ears.record_utterance(mini)
         if audio is None:
             return
@@ -361,6 +475,13 @@ class Companion:
         import os
 
         os.remove(cmd_path)
+        self.busy = True
+        try:
+            self._run_command(mini, cmd)
+        finally:
+            self.busy = False
+
+    def _run_command(self, mini, cmd: dict):
         if text := cmd.get("say"):
             log.info("dashboard says: %s", text)
             person, profile = self.person_profile(self.current_person)
@@ -406,6 +527,9 @@ class Companion:
             threading.Thread(
                 target=self._snapshot_loop, args=(mini, snap_stop), daemon=True
             ).start()
+            threading.Thread(
+                target=self._track_loop, args=(mini, snap_stop), daemon=True
+            ).start()
             log.info("companion is up — ctrl-c to stop")
             last_scan = last_idle = 0.0
             try:
@@ -420,6 +544,15 @@ class Companion:
                             last_idle = time.monotonic()
                             continue
                     self.check_commands(mini)
+                    # drain idle mic audio and measure the room's loudness
+                    peak = 0.0
+                    sample = mini.media.get_audio_sample()
+                    while sample is not None:
+                        mono = sample.mean(axis=1) if sample.ndim == 2 else sample
+                        peak = max(peak, float((mono**2).mean() ** 0.5))
+                        sample = mini.media.get_audio_sample()
+                    if peak:
+                        self.mic_rms = peak
                     now = time.monotonic()
                     if now - last_scan > self.scan_interval:
                         last_scan = now

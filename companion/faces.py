@@ -54,6 +54,15 @@ class FaceMemory:
             results.append((name, best, face))
         return results
 
+    def detect_boxes(self, frame_bgr: np.ndarray):
+        """Fast detection-only pass (no identity) — for head tracking.
+
+        Filters low-confidence hits so face-like artwork, screens and
+        posters don't hijack the robot's attention.
+        """
+        bboxes, _ = self.app.det_model.detect(frame_bgr, max_num=0, metric="default")
+        return [b for b in bboxes if b[4] > 0.62]
+
     def biggest_face(self, frame_bgr: np.ndarray):
         """The most prominent face in view, or None."""
         results = self.detect(frame_bgr)

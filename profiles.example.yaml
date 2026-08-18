@@ -6,12 +6,12 @@
 #   am_michael  am_adam  am_eric            (male)
 #   bf_emma  bm_george  bm_lewis            (british)
 people:
-  Raul:
+  YourName:
     voice: am_michael
     speed: 1.0
     style: >-
       Your human. Adjust this description.
-      projects. Be warm and a little playful with him.
+      Be warm and a little playful with them.
 unknown:
   voice: af_sky
   speed: 1.0
