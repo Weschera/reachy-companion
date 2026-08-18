@@ -41,7 +41,10 @@ class Voice:
 
     def speak(self, mini, text: str, voice: str | None = None, speed: float | None = None):
         """Speak through the robot, with the head wobbling along."""
+        import time
+
         stereo = self.synthesize(text, voice, speed)
+        duration = len(stereo) / ROBOT_RATE
         mini.enable_wobbling()
         try:
             mini.media.start_playing()
@@ -49,7 +52,9 @@ class Voice:
             chunk = ROBOT_RATE // 2
             for i in range(0, len(stereo), chunk):
                 mini.media.push_audio_sample(stereo[i : i + chunk])
+            # let the audio actually finish playing before tearing down
+            time.sleep(duration + 0.3)
             mini.media.stop_playing()
         finally:
             mini.disable_wobbling()
-        return len(stereo) / ROBOT_RATE  # seconds of speech
+        return duration  # seconds of speech

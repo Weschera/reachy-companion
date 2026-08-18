@@ -18,9 +18,11 @@ pkill -9 -f "companion.main" 2>/dev/null
 sleep 1
 
 if [ "$1" != "stop" ]; then
+    echo awake > /tmp/reachy-desired.state
     nohup uv run python -m companion.main >> /tmp/reachy-companion.log 2>&1 &
     echo "companion starting (log: /tmp/reachy-companion.log)"
 else
+    echo asleep > /tmp/reachy-desired.state
     # make sure the robot physically goes to its sleep pose, however the
     # app process died
     ROBOT=$(awk '/^robot:/{r=1} r && /host:/{print $2; exit}' config.yaml)

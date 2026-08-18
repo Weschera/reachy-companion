@@ -70,6 +70,28 @@ class Brain:
         except Exception:
             return "I couldn't reach Hermes just now."
 
+    def extract_name(self, text: str) -> str | None:
+        """Pull a first name out of a spoken introduction, or None."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=10,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "The person was just asked their name. Extract their "
+                    "first name from the reply. Answer with ONLY the name, "
+                    "or NONE if they didn't give one.",
+                },
+                {"role": "user", "content": text},
+            ],
+            extra_body=self.extra_body,
+        )
+        name = (response.choices[0].message.content or "").strip().strip(".,!")
+        name = name.split()[0].capitalize() if name else ""
+        if not name.isalpha() or not (2 <= len(name) <= 20) or name.lower() == "none":
+            return None
+        return name
+
     def greeting(self, person: str, style: str) -> str:
         return self.reply(
             person,

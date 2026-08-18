@@ -57,8 +57,11 @@ class Ears:
             audio, path_or_hf_repo=self.whisper_model, language="en"
         )
         text = result["text"].strip()
-        # whisper sometimes hallucinates loops ("face face face...") on noise
+        # whisper sometimes hallucinates loops on noise — repeated words
+        # ("face face face...") or repeated characters ("ををを...")
         words = text.lower().split()
         if len(words) > 8 and len(set(words)) / len(words) < 0.3:
+            return ""
+        if len(text) > 20 and len(set(text)) / len(text) < 0.15:
             return ""
         return text

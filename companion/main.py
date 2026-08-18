@@ -52,6 +52,24 @@ class Companion:
         self.identity_memory = 120.0
         # voice switches requested mid-conversation ("change your voice")
         self.voice_overrides: dict[str, str] = {}
+        # meeting new people
+        self.unknown_streak = 0
+        self.last_meet_attempt = 0.0
+        self.meet_cooldown = 300.0
+        # wake word + vigilante state
+        self.last_interaction = 0.0
+        self.follow_up_window = 45.0
+        self.prev_gray = None
+        self.last_motion_alert = 0.0
+
+    @staticmethod
+    def modes() -> dict:
+        """Runtime toggles written by the dashboard — no restart needed."""
+        try:
+            with open("/tmp/reachy-modes.json") as f:
+                return {"wake_word": False, "vigilante": False, **json.load(f)}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"wake_word": False, "vigilante": False}
 
     def person_profile(self, name: str | None) -> tuple[str, dict]:
         if name and name in self.profiles["people"]:
@@ -113,11 +131,50 @@ class Companion:
         except Exception:
             pass
 
+    def check_motion(self, frame):
+        """Vigilante mode: spot movement, snapshot it, send it to Raul's phone."""
+        import cv2
+
+        gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
+        prev, self.prev_gray = self.prev_gray, gray
+        if prev is None:
+            return
+        score = float(cv2.absdiff(prev, gray).mean())
+        now = time.monotonic()
+        if score > 12.0 and now - self.last_motion_alert > 60:
+            self.last_motion_alert = now
+            import datetime
+            import subprocess
+
+            from .config import ROOT
+
+            snapdir = ROOT / "data" / "vigilante"
+            snapdir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = snapdir / f"{stamp}.jpg"
+            cv2.imwrite(str(path), frame)
+            log.info("vigilante: motion (score %.1f) → %s", score, path.name)
+            subprocess.Popen(
+                ["hermes", "send", "-t", "telegram", "-q",
+                 f"👁 Reachy vigilante: movement spotted at {stamp[9:11]}:{stamp[11:13]} MEDIA:{path}"],
+            )
+
+    def _snapshot_loop(self, mini, stop):
+        """Background thread: keep the dashboard's camera view fresh even
+        while the main loop is busy listening or talking."""
+        while not stop.is_set():
+            try:
+                self.share_state(mini.media.get_frame())
+            except Exception:
+                pass
+            stop.wait(2.0)
+
     def scan_faces(self, mini):
         frame = mini.media.get_frame()
-        self.share_state(frame)
         if frame is None:
             return
+        if self.modes()["vigilante"]:
+            self.check_motion(frame)
         found = self.faces.biggest_face(frame)
         if found is None:
             return
@@ -127,11 +184,20 @@ class Companion:
         if name is not None:
             self.current_person = name
             self.last_seen_at = now
+            self.unknown_streak = 0
         elif now - self.last_seen_at > self.identity_memory:
             # only forget a known person after a couple of minutes unseen
             self.current_person = None
         if name is None:
+            # a stranger keeps appearing — introduce ourselves and learn them
+            self.unknown_streak += 1
+            if (
+                self.unknown_streak >= 3
+                and now - self.last_meet_attempt > self.meet_cooldown
+            ):
+                self.meet_new_person(mini)
             return
+        self.unknown_streak = 0
         now = time.monotonic()
         if now - self.last_greeted.get(name, -1e9) > self.greet_cooldown:
             self.last_greeted[name] = now
@@ -139,6 +205,70 @@ class Companion:
             log.info("greeting %s", person)
             text = self.brain.greeting(person, profile["style"])
             self.voice.speak(mini, text, profile["voice"], profile.get("speed"))
+
+    VOICES = [
+        "af_heart", "af_bella", "af_nicole", "af_sky",
+        "am_michael", "am_adam", "am_eric",
+        "bf_emma", "bm_george", "bm_lewis",
+    ]
+
+    def assign_voice(self, name: str) -> str:
+        """Give a newly met person their own voice and save their profile."""
+        used = {p.get("voice") for p in self.profiles.get("people", {}).values()}
+        voice = next((v for v in self.VOICES if v not in used), "af_heart")
+        self.profiles.setdefault("people", {})[name] = {
+            "voice": voice,
+            "speed": 1.0,
+            "style": f"This is {name}. You just met them — be friendly.",
+        }
+        import yaml
+
+        from .config import ROOT
+
+        (ROOT / "profiles.yaml").write_text(
+            "# People Reachy knows — managed from the dashboard.\n"
+            + yaml.safe_dump(self.profiles, sort_keys=False, allow_unicode=True)
+        )
+        return voice
+
+    def meet_new_person(self, mini):
+        """Someone unfamiliar keeps appearing — ask who they are and learn them."""
+        self.last_meet_attempt = time.monotonic()
+        self.unknown_streak = 0
+        log.info("meeting a new face")
+        self.voice.speak(mini, "Hi there! I don't think we've met yet. What's your name?")
+        self.ears.drain(mini)
+        audio = self.ears.record_utterance(mini)
+        text = self.ears.transcribe(audio) if audio is not None else ""
+        name = self.brain.extract_name(text) if text else None
+        if not name:
+            log.info("no name caught (heard: %r)", text)
+            self.voice.speak(mini, "No worries — we can meet another time!")
+            return
+        if name in self.faces.known:
+            self.voice.speak(mini, f"Oh, {name} — I know a {name} already! I'll get better at telling you apart.")
+            return
+        self.voice.speak(
+            mini, f"Nice to meet you, {name}! Hold still a moment while I remember your face."
+        )
+        embeddings = []
+        deadline = time.monotonic() + 20
+        while len(embeddings) < 10 and time.monotonic() < deadline:
+            frame = mini.media.get_frame()
+            if frame is not None:
+                found = self.faces.biggest_face(frame)
+                if found is not None and found[0] is None:
+                    embeddings.append(found[2].normed_embedding)
+            time.sleep(0.3)
+        if len(embeddings) < 5:
+            self.voice.speak(mini, "Hmm, I couldn't get a clear look. Another time!")
+            return
+        self.faces.enroll(name, embeddings)
+        voice = self.assign_voice(name)
+        self.current_person = name
+        self.last_seen_at = time.monotonic()
+        log.info("auto-enrolled %s with voice %s", name, voice)
+        self.voice.speak(mini, f"Got it — I'll remember you now, {name}!", voice)
 
     def converse(self, mini):
         audio = self.ears.record_utterance(mini)
@@ -165,6 +295,15 @@ class Companion:
         text = self.ears.transcribe(audio)
         if len(text) < 2:
             return
+        # wake-word mode: only respond when addressed (or mid-conversation)
+        if self.modes()["wake_word"]:
+            lowered = text.lower()
+            addressed = any(w in lowered for w in ("reachy", "richie", "ritchie", "reach"))
+            in_conversation = time.monotonic() - self.last_interaction < self.follow_up_window
+            if not addressed and not in_conversation:
+                log.info("ignored (wake-word mode, not addressed): %s", text)
+                return
+        self.last_interaction = time.monotonic()
         person, profile = self.person_profile(self.current_person)
         log.info("%s said: %s", person, text)
         answer = self.brain.reply(person, profile["style"], text)
@@ -261,6 +400,12 @@ class Companion:
             mini.wake_up()
             mini.media.start_recording()
             self.ears.drain(mini)
+            import threading
+
+            snap_stop = threading.Event()
+            threading.Thread(
+                target=self._snapshot_loop, args=(mini, snap_stop), daemon=True
+            ).start()
             log.info("companion is up — ctrl-c to stop")
             last_scan = last_idle = 0.0
             try:
@@ -286,6 +431,7 @@ class Companion:
             except KeyboardInterrupt:
                 log.info("good night")
             finally:
+                snap_stop.set()
                 mini.media.stop_recording()
                 mini.goto_sleep()
 

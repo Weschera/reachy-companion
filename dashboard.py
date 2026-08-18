@@ -87,7 +87,7 @@ def state():
     return {
         "running": companion_running(),
         "person": status.get("person") if fresh else None,
-        "frame_fresh": FRAME.exists() and time.time() - FRAME.stat().st_mtime < 10,
+        "frame_fresh": FRAME.exists() and time.time() - FRAME.stat().st_mtime < 15,
     }
 
 
@@ -206,6 +206,63 @@ def enroll(body: Enroll):
         return JSONResponse({"error": "Reachy is asleep"}, status_code=409)
     CMD.write_text(json.dumps({"enroll": name}))
     return {"ok": True}
+
+
+class Volume(BaseModel):
+    volume: int
+
+
+@app.get("/api/volume")
+def get_volume():
+    cfg = _cfg()
+    url = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}/api/volume/current"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return json.load(r)
+    except Exception:
+        return JSONResponse({"error": "robot unreachable"}, status_code=502)
+
+
+@app.post("/api/volume")
+def set_volume_ep(body: Volume):
+    cfg = _cfg()
+    url = f"http://{cfg['robot']['host']}:{cfg['robot']['port']}/api/volume/set"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"volume": max(0, min(100, body.volume))}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)
+    except Exception:
+        return JSONResponse({"error": "robot unreachable"}, status_code=502)
+
+
+MODES = Path("/tmp/reachy-modes.json")
+
+
+class Modes(BaseModel):
+    wake_word: bool | None = None
+    vigilante: bool | None = None
+
+
+@app.get("/api/modes")
+def get_modes():
+    try:
+        return {"wake_word": False, "vigilante": False, **json.loads(MODES.read_text())}
+    except Exception:
+        return {"wake_word": False, "vigilante": False}
+
+
+@app.post("/api/modes")
+def set_modes(body: Modes):
+    current = get_modes()
+    for k, v in body.model_dump(exclude_none=True).items():
+        current[k] = v
+    MODES.write_text(json.dumps(current))
+    return current
 
 
 @app.post("/api/estop")
@@ -413,6 +470,18 @@ PAGE = """<!doctype html>
   <div class="people" id="people"></div>
 
   <div class="brainrow">
+    <label for="vol">Volume</label>
+    <input type="range" id="vol" min="0" max="100" step="5"
+           style="flex:1; accent-color: var(--warm);">
+    <span id="volval" style="color:var(--dim); font-size:13px; width:32px; text-align:right;">–</span>
+  </div>
+
+  <div class="health" id="modes">
+    <div class="chip toggle" data-m="wake_word"><div class="light"></div>wake word</div>
+    <div class="chip toggle" data-m="vigilante"><div class="light"></div>vigilante</div>
+  </div>
+
+  <div class="brainrow">
     <label for="brain">Brain</label>
     <select id="brain"></select>
   </div>
@@ -537,6 +606,40 @@ async function refreshPeople() {
   } catch (e) {}
 }
 refreshPeople();
+
+// --- volume ---
+const vol = document.getElementById('vol'), volval = document.getElementById('volval');
+fetch('/api/volume').then(r => r.json()).then(v => {
+  if (v.volume !== undefined) { vol.value = v.volume; volval.textContent = v.volume; }
+});
+vol.oninput = () => volval.textContent = vol.value;
+let volTimer;
+vol.onchange = () => {
+  clearTimeout(volTimer);
+  volTimer = setTimeout(() =>
+    fetch('/api/volume', { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ volume: +vol.value }) }), 300);
+};
+
+// --- modes ---
+async function refreshModes() {
+  try {
+    const m = await (await fetch('/api/modes')).json();
+    document.querySelectorAll('.chip.toggle').forEach(c =>
+      c.classList.toggle('ok', !!m[c.dataset.m]));
+  } catch (e) {}
+}
+document.querySelectorAll('.chip.toggle').forEach(c => {
+  c.style.cursor = 'pointer';
+  c.onclick = async () => {
+    const on = !c.classList.contains('ok');
+    await fetch('/api/modes', { method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ [c.dataset.m]: on }) });
+    refreshModes();
+  };
+});
+refreshModes();
 
 // --- emergency stop ---
 document.getElementById('estop').onclick = () =>
