@@ -430,7 +430,12 @@ def add_model(body: NewModel):
     if body.api_key:
         block += f"      api_key: {json.dumps(body.api_key.strip())}\n"
     text = path.read_text()
-    new_text = re.sub(r"(?m)^(  models:)$", rf"\g<1>\n{block.rstrip()}", text, count=1)
+    new_text = re.sub(
+        r"(?m)^(  models:)$",
+        lambda m: m.group(1) + "\n" + block.rstrip(),
+        text,
+        count=1,
+    )
     if new_text == text:
         return JSONResponse({"error": "could not find models section"}, status_code=500)
     yaml.safe_load(new_text)  # sanity: still valid yaml
