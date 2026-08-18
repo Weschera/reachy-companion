@@ -21,8 +21,9 @@ import urllib.request
 from reachy_mini import ReachyMini
 
 from .brain import Brain
-from .config import load_config, load_profiles
+from .config import load_config, load_profiles, resolve_brain
 from .ears import Ears
+from .eyes import Eyes
 from .faces import FaceMemory, face_center
 from .voice import Voice
 
@@ -39,7 +40,8 @@ class Companion:
         log.info("loading voice (kokoro)...")
         self.voice = Voice(cfg["voice"])
         self.ears = Ears(cfg["ears"])
-        self.brain = Brain(cfg["brain"])
+        self.brain = Brain(resolve_brain(cfg))
+        self.eyes = Eyes(cfg["eyes"]) if "eyes" in cfg else None
         self.greet_cooldown = float(cfg["faces"]["greet_cooldown"])
         self.scan_interval = float(cfg["faces"]["scan_interval"])
         self.idle_interval = float(cfg["behavior"]["idle_interval"])
@@ -157,6 +159,23 @@ class Companion:
         log.info("%s said: %s", person, text)
         answer = self.brain.reply(person, profile["style"], text)
         log.info("reachy: %s", answer)
+        # vision questions go to the Cosmos eyes with a fresh camera frame
+        if answer.lstrip().lower().startswith("[look]") and self.eyes:
+            question = answer.lstrip()[6:].strip() or text
+            frame = mini.media.get_frame()
+            voice = self.voice_overrides.get(person, profile["voice"])
+            if frame is None:
+                answer = "My camera is coming up blank right now."
+            else:
+                log.info("looking: %s", question)
+                try:
+                    answer = self.eyes.look(frame, question)
+                except Exception:
+                    answer = "My eyes aren't answering right now."
+                log.info("eyes: %s", answer)
+            self.brain.histories[person][-1]["content"] = answer
+            self.voice.speak(mini, answer, voice, profile.get("speed"))
+            return
         # real tasks get handed to the Hermes agent
         if answer.lstrip().lower().startswith("[hermes]"):
             task = answer.lstrip()[8:].strip()

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
@@ -97,6 +98,32 @@ def frame():
     return JSONResponse({"error": "no frame"}, status_code=404)
 
 
+@app.get("/api/models")
+def models():
+    cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+    brain = cfg.get("brain", {})
+    return {
+        "active": brain.get("active"),
+        "options": [
+            {"key": k, "label": v.get("label", k)}
+            for k, v in brain.get("models", {}).items()
+        ],
+    }
+
+
+@app.post("/api/models/{key}")
+def set_model(key: str):
+    path = ROOT / "config.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    if key not in cfg.get("brain", {}).get("models", {}):
+        return JSONResponse({"error": "unknown model"}, status_code=400)
+    # line-level replace keeps comments and formatting intact
+    text = re.sub(r"(?m)^(  active: ).*$", rf"\g<1>{key}", path.read_text(), count=1)
+    path.write_text(text)
+    subprocess.Popen([str(ROOT / "restart.sh")])
+    return {"ok": True, "active": key}
+
+
 @app.post("/api/control/{action}")
 def control(action: str):
     if action == "sleep":
@@ -168,6 +195,14 @@ PAGE = """<!doctype html>
   .msg.event { align-self: center; background: none; color: var(--dim); font-size: 12px;
                padding: 0 6px; }
 
+  .brainrow { display: flex; align-items: center; gap: 10px;
+              background: var(--panel); border-radius: 13px; padding: 10px 14px; }
+  .brainrow label { color: var(--dim); font-size: 13px; flex: none; }
+  select {
+    flex: 1; background: var(--panel-2); color: var(--text); border: 0;
+    border-radius: 9px; padding: 8px 10px; font: 500 13px/1 -apple-system, system-ui, sans-serif;
+    appearance: none; -webkit-appearance: none; cursor: pointer;
+  }
   .controls { display: flex; gap: 10px; }
   button {
     flex: 1; padding: 12px 0; border: 0; border-radius: 13px; cursor: pointer;
@@ -200,6 +235,11 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="chat" id="chat"></div>
+
+  <div class="brainrow">
+    <label for="brain">Brain</label>
+    <select id="brain"></select>
+  </div>
 
   <div class="controls">
     <button class="primary" id="wake">Wake up</button>
@@ -249,6 +289,20 @@ function bind(id, action) {
     fetch('/api/control/' + action, { method: 'POST' }).then(() => setTimeout(refreshState, 1500));
 }
 bind('wake', 'wake'); bind('restart', 'restart'); bind('sleep', 'sleep');
+
+const brainSel = document.getElementById('brain');
+async function loadModels() {
+  try {
+    const m = await (await fetch('/api/models')).json();
+    brainSel.innerHTML = m.options.map(o =>
+      `<option value="${o.key}" ${o.key === m.active ? 'selected' : ''}>${esc(o.label)}</option>`
+    ).join('');
+  } catch (e) {}
+}
+brainSel.onchange = () =>
+  fetch('/api/models/' + brainSel.value, { method: 'POST' })
+    .then(() => setTimeout(refreshState, 2000));
+loadModels();
 
 refreshState(); refreshChat();
 setInterval(refreshState, 2000);

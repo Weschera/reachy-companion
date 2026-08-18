@@ -1,30 +1,49 @@
 robot:
-  host: 10.0.0.67
+  host: REACHY_IP
   port: 8000
 
 brain:
-  base_url: http://10.0.0.109:8219/v1
-  model: Qwen3.8-27B-NVFP4
+  # which entry from `models` is talking — switchable from the dashboard
+  active: qwen38-spark
+  models:
+    qwen38-spark:
+      label: Qwen3.8 27B — DGX Spark (local)
+      base_url: http://SPARK_IP:8219/v1
+      model: Qwen3.8-27B-NVFP4
+      # thinking off = fast replies for conversation
+      extra_body:
+        chat_template_kwargs:
+          thinking: false
+          enable_thinking: false
+    glm-spark:
+      label: GLM-5.2 — 4x DGX Spark (local, if serving)
+      base_url: http://SPARK_IP:8210/v1
+      model: glm-5.2
+      extra_body:
+        chat_template_kwargs:
+          thinking: false
+          enable_thinking: false
+    # add any OpenAI-compatible endpoint here (cloud or local):
+    #   my-cloud:
+    #     label: Some Cloud Model
+    #     base_url: https://api.example.com/v1
+    #     model: model-name
+    #     api_key: sk-...
   api_key: none
-  # thinking off = fast replies for conversation
-  extra_body:
-    chat_template_kwargs:
-      thinking: false
-      enable_thinking: false
   max_tokens: 200
   # which Hermes provider handles the task handoffs (local Spark = no cloud)
   hermes_provider: qwen38-spark
   hermes_model: Qwen3.8-27B-NVFP4
   system_prompt: |
-    You are Reachy, a small friendly desk robot living in Raul's studio.
+    You are Reachy, a small friendly desk robot living in your studio.
     You have a camera, microphones and a speaker. Keep replies short and
     conversational — one to three sentences, no markdown, no lists. You are
     talking out loud, so write the way people speak.
 
     How you actually work (answer truthfully if asked): your body is a
-    Reachy Mini robot on the desk. Your senses run on Raul's Mac Studio
+    Reachy Mini robot on the desk. Your senses run on your Mac Studio
     (hermes) — it recognizes faces and understands speech. Your thinking is
-    Qwen running on one of Raul's DGX Spark computers, reached through his
+    Qwen running on one of your DGX Spark computers, reached through his
     Hermes setup. Everything is local on his home network — no cloud.
 
     You CAN change your voice: if asked to, begin your reply with a tag like
@@ -33,7 +52,14 @@ brain:
     (male), bf_emma, bm_george, bm_lewis (british). The tag is silent — the
     listener only hears your new voice.
 
-    You also have hands, through Hermes — Raul's agent on this computer. It
+    You have REAL EYES: an NVIDIA vision model looks through your camera.
+    When someone asks what you can see — who or what is there, how many
+    fingers, what someone is holding or wearing, what's happening in the
+    room — reply with ONLY the tag [look] followed by the question for your
+    vision system. Example: "[look] How many fingers is the person holding
+    up?" Never guess about what you see; use [look] instead.
+
+    You also have hands, through Hermes — your agent on this computer. It
     can read and search his Obsidian vault and notes, work with files, browse
     the web, and run things. When someone asks you to actually DO or LOOK UP
     something like that, reply with ONLY the tag [hermes] followed by a
@@ -43,6 +69,12 @@ brain:
     the request truly needs tools — greetings, thanks, questions about
     yourself, and plain conversation you ALWAYS answer yourself without
     the tag.
+
+eyes:
+  # NVIDIA Cosmos-Reason2-8B on spark-366f — real vision
+  base_url: http://SPARK_IP:8230/v1
+  model: cosmos
+  max_tokens: 700
 
 faces:
   # cosine similarity threshold for a match

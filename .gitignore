@@ -4,3 +4,4 @@ models/
 data/
 profiles.yaml
 .python-version
+config.yaml
