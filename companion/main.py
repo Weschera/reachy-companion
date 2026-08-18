@@ -15,6 +15,7 @@ import logging
 import math
 import random
 import re
+import threading
 import time
 import urllib.request
 
@@ -61,9 +62,11 @@ class Companion:
         self.follow_up_window = 45.0
         self.prev_gray = None
         self.last_motion_alert = 0.0
-        # face tracking
+        # face tracking — one mover at a time, or daemon tasks preempt each
+        # other and raise TimeoutError
         self.busy = False
         self.last_tracked = 0.0
+        self.motion_lock = threading.Lock()
         # live mic level for the dashboard meter
         self.mic_rms = 0.0
 
@@ -100,7 +103,14 @@ class Companion:
         # DOA: 0 = left, pi/2 = front, pi = right. Body yaw: positive = left.
         yaw = max(-1.4, min(1.4, math.pi / 2 - angle))
         if abs(yaw) > 0.25:
-            mini.goto_target(body_yaw=yaw, duration=0.6)
+            if not self.motion_lock.acquire(blocking=False):
+                return
+            try:
+                mini.goto_target(body_yaw=yaw, duration=0.6)
+            except Exception:
+                pass
+            finally:
+                self.motion_lock.release()
 
     def look_at_face(self, mini, face):
         u, v = face_center(face)
@@ -110,21 +120,28 @@ class Companion:
             pass
 
     def idle_wiggle(self, mini):
-        # while watching someone, only the antennas fidget — the head is theirs
-        if time.monotonic() - self.last_tracked < 5.0:
-            a = random.uniform(0.1, 0.4)
-            mini.goto_target(antennas=[-a, a], duration=0.6)
-            mini.goto_target(antennas=[-0.1745, 0.1745], duration=0.6)
+        if not self.motion_lock.acquire(blocking=False):
             return
-        r = random.random()
-        if r < 0.5:
-            a = random.uniform(0.1, 0.5)
-            mini.goto_target(antennas=[-a, a], duration=0.7)
-            mini.goto_target(antennas=[-0.1745, 0.1745], duration=0.7)
-        else:
-            yaw = random.uniform(-0.5, 0.5)
-            mini.goto_target(body_yaw=yaw, duration=1.2)
-            mini.goto_target(body_yaw=0.0, duration=1.2)
+        try:
+            # while watching someone, only the antennas fidget
+            if time.monotonic() - self.last_tracked < 5.0:
+                a = random.uniform(0.1, 0.4)
+                mini.goto_target(antennas=[-a, a], duration=0.6)
+                mini.goto_target(antennas=[-0.1745, 0.1745], duration=0.6)
+                return
+            r = random.random()
+            if r < 0.5:
+                a = random.uniform(0.1, 0.5)
+                mini.goto_target(antennas=[-a, a], duration=0.7)
+                mini.goto_target(antennas=[-0.1745, 0.1745], duration=0.7)
+            else:
+                yaw = random.uniform(-0.5, 0.5)
+                mini.goto_target(body_yaw=yaw, duration=1.2)
+                mini.goto_target(body_yaw=0.0, duration=1.2)
+        except Exception:
+            pass
+        finally:
+            self.motion_lock.release()
 
     def share_state(self, frame):
         """Drop a snapshot + status file for the dashboard."""
@@ -187,11 +204,9 @@ class Companion:
         Full-speed chasing oscillates; this converges.
         """
         GAIN = 0.7
-        LEAD = 0.15  # seconds of velocity lead — aim where the face is heading
         DEADBAND = 0.11  # fraction of frame size — a wide calm zone
         CMD_SPACING = 0.55  # let each move show up on camera before the next
         last_pos = None  # face position last seen (u, v)
-        last_t = 0.0
         last_cmd = 0.0
         lost_since = None
         while not stop.is_set():
@@ -213,17 +228,17 @@ class Companion:
                     if lost_since is None:
                         lost_since = now
                     elif now - lost_since > 2.5:
-                        log.info("track: face lost — recentering")
-                        import numpy as np
-
-                        from reachy_mini.reachy_mini import INIT_HEAD_POSE
-
-                        mini.goto_target(
-                            head=INIT_HEAD_POSE, body_yaw=0.0, duration=1.2
-                        )
+                        # reset state FIRST so a failed move can't spam retries
                         lost_since = None
                         last_pos = None
                         self.last_tracked = 0.0
+                        log.info("track: face lost — recentering")
+                        from reachy_mini.reachy_mini import INIT_HEAD_POSE
+
+                        with self.motion_lock:
+                            mini.goto_target(
+                                head=INIT_HEAD_POSE, body_yaw=0.0, duration=1.2
+                            )
                     continue
                 lost_since = None
 
@@ -241,30 +256,18 @@ class Companion:
                     box = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
                 u, v = center(box)
                 now = time.monotonic()
-                # velocity of the face in the image → lead the moving target
-                vx = vy = 0.0
-                if last_pos is not None and 0 < now - last_t < 0.5:
-                    vx = (u - last_pos[0]) / (now - last_t)
-                    vy = (v - last_pos[1]) / (now - last_t)
-                last_pos, last_t = (u, v), now
+                last_pos = (u, v)
                 # settle with the gaze a touch lower — eye contact, not hairline
                 dx, dy = u - cx, v - cy + 0.05 * h
                 self.last_tracked = now
-                if now - getattr(self, "_track_dbg_at", 0) > 5:
-                    self._track_dbg_at = now
-                    log.info("track: face u=%d v=%d dx=%d dy=%d busy=%s", u, v, dx, dy, self.busy)
                 if now - last_cmd < CMD_SPACING:
                     continue  # previous move hasn't reached the camera yet
                 if abs(dx) < DEADBAND * w and abs(dy) < DEADBAND * h:
                     continue  # close enough — hold still
-                # ignore jittery velocity readings; only lead real movement
-                if abs(vx) < 90:
-                    vx = 0.0
-                if abs(vy) < 90:
-                    vy = 0.0
-                aim_u = max(0, min(w - 1, cx + GAIN * dx + LEAD * vx))
-                aim_v = max(0, min(h - 1, cy + GAIN * dy + LEAD * vy))
-                mini.look_at_image(u=int(aim_u), v=int(aim_v), duration=0.45)
+                aim_u = max(0, min(w - 1, cx + GAIN * dx))
+                aim_v = max(0, min(h - 1, cy + GAIN * dy))
+                with self.motion_lock:
+                    mini.look_at_image(u=int(aim_u), v=int(aim_v), duration=0.45)
                 last_cmd = now
             except Exception:
                 if time.monotonic() - getattr(self, "_track_err_at", 0) > 30:
@@ -564,6 +567,16 @@ class Companion:
                             self.turn_toward_sound(mini, angle)
                             self.converse(mini)
                             self.ears.drain(mini)
+                            # linger: catch follow-up questions asked right
+                            # after the reply, before going back to idle
+                            linger = time.monotonic()
+                            while time.monotonic() - linger < 2.5:
+                                doa2 = self.get_doa()
+                                if doa2 is not None and doa2[1]:
+                                    self.converse(mini)
+                                    self.ears.drain(mini)
+                                    linger = time.monotonic()
+                                time.sleep(0.05)
                             last_idle = time.monotonic()
                             continue
                     self.check_commands(mini)
@@ -596,7 +609,16 @@ def main():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(message)s"
     )
-    Companion().run()
+    # survive robot hiccups: reconnect instead of dying
+    while True:
+        try:
+            Companion().run()
+            break  # clean exit (ctrl-c / sleep)
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            log.exception("companion crashed — reconnecting in 10s")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
