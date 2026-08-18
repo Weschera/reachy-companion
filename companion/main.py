@@ -258,11 +258,11 @@ class Companion:
                 now = time.monotonic()
                 last_pos = (u, v)
                 # settle with the gaze a touch lower — eye contact, not hairline
-                dx, dy = u - cx, v - cy + 0.05 * h
+                dx, dy = u - cx, v - cy + 0.12 * h
                 self.last_tracked = now
                 if now - last_cmd < CMD_SPACING:
                     continue  # previous move hasn't reached the camera yet
-                if abs(dx) < DEADBAND * w and abs(dy) < DEADBAND * h:
+                if abs(dx) < DEADBAND * w and -0.05 * h < dy < DEADBAND * h:
                     continue  # close enough — hold still
                 aim_u = max(0, min(w - 1, cx + GAIN * dx))
                 aim_v = max(0, min(h - 1, cy + GAIN * dy))
