@@ -93,7 +93,7 @@ def state():
         "running": companion_running(),
         "person": status.get("person") if fresh else None,
         "activity": status.get("activity") if fresh else None,
-        "frame_fresh": FRAME.exists() and time.time() - FRAME.stat().st_mtime < 15,
+        "frame_fresh": FRAME.exists() and time.time() - FRAME.stat().st_mtime < 30,
     }
 
 
@@ -691,10 +691,18 @@ async function refreshState() {
     }
     document.getElementById('sub').textContent = sub;
     const cam = document.getElementById('cam'), off = document.getElementById('camoff');
-    if (s.frame_fresh) {
+    if (s.running) {
+      // keep the stream mounted; only overlay a note when frames lag
       if (!cam.src.includes('/api/stream')) cam.src = '/api/stream';
-      cam.hidden = false; off.style.display = 'none';
-    } else { cam.removeAttribute('src'); cam.hidden = true; off.style.display = 'flex'; }
+      cam.hidden = false;
+      off.style.display = s.frame_fresh ? 'none' : 'flex';
+      off.style.background = s.frame_fresh ? '' : 'transparent';
+      off.textContent = s.frame_fresh ? '' : 'catching up…';
+    } else {
+      cam.removeAttribute('src'); cam.hidden = true;
+      off.style.display = 'flex'; off.style.background = '';
+      off.textContent = 'camera asleep';
+    }
   } catch (e) {}
 }
 

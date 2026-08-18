@@ -1,9 +1,19 @@
 """The brain: local Qwen3.8 on the Spark for fast chat, with real tasks
 handed off to the Hermes agent (which has tools: files, vault, web, email)."""
 
+import re
 import subprocess
 
 from openai import OpenAI
+
+
+def strip_thinking(text: str) -> str:
+    """Qwen sometimes leaks its <think> monologue into the reply — never
+    speak that out loud."""
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    text = re.sub(r"<think>.*", "", text, flags=re.S)
+    return text.strip()
 
 
 class Brain:
@@ -36,7 +46,7 @@ class Brain:
             max_tokens=self.max_tokens,
             extra_body=self.extra_body,
         )
-        answer = (response.choices[0].message.content or "").strip()
+        answer = strip_thinking(response.choices[0].message.content or "")
         if not answer:
             # model went blank — don't leave a hole in the conversation
             answer = "Hm, I lost my train of thought. What were you saying?"
@@ -86,7 +96,7 @@ class Brain:
             ],
             extra_body=self.extra_body,
         )
-        name = (response.choices[0].message.content or "").strip().strip(".,!")
+        name = strip_thinking(response.choices[0].message.content or "").strip(".,!")
         name = name.split()[0].capitalize() if name else ""
         if not name.isalpha() or not (2 <= len(name) <= 20) or name.lower() == "none":
             return None
