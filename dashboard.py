@@ -206,7 +206,11 @@ def health():
     checks = {
         "robot": robot_check,
         "brain": lambda: _http_ok(f"{brain_cfg.get('base_url', '')}/models"),
-        "eyes": lambda: _http_ok(f"{cfg.get('eyes', {}).get('base_url', '')}/models"),
+        "eyes": lambda: (
+            companion_running()
+            if cfg.get("eyes", {}).get("local_model")
+            else _http_ok(f"{cfg.get('eyes', {}).get('base_url', '')}/models")
+        ),
         "hermes": lambda: shutil.which("hermes") is not None,
     }
     with ThreadPoolExecutor(max_workers=4) as pool:

@@ -19,6 +19,12 @@ sleep 1
 
 if [ "$1" != "stop" ]; then
     echo awake > /tmp/reachy-desired.state
+    # if the robot was just switched on, wait for it to finish booting
+    ROBOT=$(awk '/^robot:/{r=1} r && /host:/{print $2; exit}' config.yaml)
+    for i in {1..40}; do
+        curl -s -m 3 -o /dev/null "http://$ROBOT:8000/api/daemon/status" && break
+        sleep 3
+    done
     nohup uv run python -m companion.main >> /tmp/reachy-companion.log 2>&1 &
     echo "companion starting (log: /tmp/reachy-companion.log)"
 else
