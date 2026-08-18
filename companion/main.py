@@ -69,6 +69,8 @@ class Companion:
         self.motion_lock = threading.Lock()
         # live mic level for the dashboard meter
         self.mic_rms = 0.0
+        # connection watchdog
+        self.last_frame_at = time.monotonic()
 
     @staticmethod
     def modes() -> dict:
@@ -279,7 +281,10 @@ class Companion:
         while the main loop is busy listening or talking."""
         while not stop.is_set():
             try:
-                self.share_state(mini.media.get_frame())
+                frame = mini.media.get_frame()
+                if frame is not None:
+                    self.last_frame_at = time.monotonic()
+                self.share_state(frame)
             except Exception:
                 pass
             stop.wait(0.25)
@@ -579,6 +584,10 @@ class Companion:
                                 time.sleep(0.05)
                             last_idle = time.monotonic()
                             continue
+                    # watchdog: if the camera feed has been dead for 30s the
+                    # connection is wedged — bail out so we reconnect fresh
+                    if time.monotonic() - self.last_frame_at > 30:
+                        raise ConnectionError("media stalled — reconnecting")
                     self.check_commands(mini)
                     # drain idle mic audio and measure the room's loudness
                     peak = 0.0
@@ -601,8 +610,11 @@ class Companion:
                 log.info("good night")
             finally:
                 snap_stop.set()
-                mini.media.stop_recording()
-                mini.goto_sleep()
+                for cleanup in (mini.media.stop_recording, mini.goto_sleep):
+                    try:
+                        cleanup()
+                    except Exception:
+                        pass
 
 
 def main():
